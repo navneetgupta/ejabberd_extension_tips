@@ -1,0 +1,248 @@
+-module(node_push).
+-author("Navneet Gupta <navneetpgupta@gmial.com>").
+
+-behaviour(gen_pubsub_node).
+
+-include("xmpp.hrl").
+-include("logger.hrl").
+-include("pubsub.hrl").
+
+-export([init/3, terminate/2, options/0, features/0,
+    create_node_permission/6, create_node/2, delete_node/1,
+    purge_node/2, subscribe_node/8, unsubscribe_node/4,
+    publish_item/7, delete_item/4, remove_extra_items/3,
+    get_entity_affiliations/2, get_node_affiliations/1,
+    get_affiliation/2, set_affiliation/3,
+    get_entity_subscriptions/2, get_node_subscriptions/1,
+    get_subscriptions/2, set_subscriptions/4,
+    get_pending_nodes/2, get_states/1, get_state/2,
+    set_state/1, get_items/7, get_items/3, get_item/7,
+    get_last_items/3, get_only_item/2,
+    get_item/2, set_item/1, get_item_name/3, node_to_path/1,
+    path_to_node/1, depends/3]).
+
+depends(_Host, _ServerHost, _Opts) ->
+	[].
+
+init(Host, ServerHost, Opts) ->
+    node_flat:init(Host, ServerHost, Opts),
+    ok.
+
+terminate(Host, ServerHost) ->
+    node_flat:terminate(Host, ServerHost),
+    ok.
+
+options() ->
+    [{deliver_payloads, true},
+	{notify_config, false},
+	{notify_delete, false},
+	{notify_retract, false},
+	{purge_offline, false},
+	{persist_items, true},
+	{max_items, 1},
+	{subscribe, true},
+	{access_model, whitelist},
+	{roster_groups_allowed, []},
+	{publish_model, open},
+	{notification_type, headline},
+	{max_payload_size, ?MAX_PAYLOAD_SIZE},
+	{send_last_published_item, on_sub_and_presence},
+	{deliver_notifications, true},
+	{presence_based_delivery, true}].
+
+features() ->
+    [
+        <<"create-nodes">>,
+        <<"delete-nodes">>,
+        <<"modify-affiliations">>,
+        <<"publish">>,
+        <<"publish-options">>,
+        <<"publish-only-affiliation">>,
+        <<"purge-nodes">>,
+        <<"retrieve-affiliations">>
+    ].
+
+
+create_node_permission(Host, ServerHost, _Node, _ParentNode, Owner, Access) ->
+    LOwner = jid:tolower(Owner),
+		?INFO_MSG("node_push:create_node_permission wiht params Host: ~p, ServerHost: ~p, Owner: ~p, Access: ~p", [Host, ServerHost, Owner, Access]),
+    {User, Server, _Resource} = LOwner,
+    Allowed = case LOwner of
+	{<<"">>, Host, <<"">>} ->
+	    true; % pubsub service always allowed
+	_ ->
+	    case acl:match_rule(ServerHost, Access, LOwner) of
+		allow ->
+			true;
+		_ ->
+		    false
+	    end
+    end,
+    {result, Allowed}.
+
+create_node(Nidx, Owner) ->
+    node_flat:create_node(Nidx, Owner).
+
+delete_node(Nodes) ->
+    node_flat:delete_node(Nodes).
+
+subscribe_node(Nidx, Sender, Subscriber, AccessModel,
+	    SendLast, PresenceSubscription, RosterGroup, Options) ->
+    node_flat:subscribe_node(Nidx, Sender, Subscriber, AccessModel, SendLast,
+	PresenceSubscription, RosterGroup, Options).
+
+unsubscribe_node(Nidx, Sender, Subscriber, SubId) ->
+    case node_flat:unsubscribe_node(Nidx, Sender, Subscriber, SubId) of
+	{error, Error} -> {error, Error};
+	{result, _} -> {result, []}
+    end.
+
+publish_item(Nidx, Publisher, Model, _MaxItems, _ItemId, Payload, PubOpts) ->
+	?INFO_MSG("node_push: publish_item nIdx: ~p, Publisher: ~p, Model: ~p, PayLoad: ~p, PubOpts: ~p", [Nidx, Publisher, Model,Payload, PubOpts]),
+	SubKey = jid:tolower(Publisher),
+	GenKey = jid:remove_resource(SubKey),
+	GenState = get_state(Nidx, GenKey),
+	SubState = case SubKey of
+		GenKey -> GenState;
+		_ -> get_state(Nidx, SubKey)
+	end,
+	Affiliation = GenState#pubsub_state.affiliation,
+	% {result, Affiliation} = node_flat:get_affiliation(Nidx, Publisher),
+	?INFO_MSG("Affiliation is: ~p", [Affiliation]),
+	ElPayload = [El || #push_notification{} = El <- Payload],
+	do_publish_item(PubOpts, ElPayload).  %% here assuming only valid request are coming will send notification wihtout futher validation.
+	% case is_allowed_to_publish(Model, Affiliation) of
+  %       true ->
+	%
+  %       false ->
+  %           {error, xmpp:err_forbidden()}
+  %   end.
+
+do_publish_item(PublishOptions, ElPayload) ->
+	?INFO_MSG("node_push:do_publish_item PublishOptions: ~p, ElPayLoad: ~p", [PublishOptions, ElPayload]),
+	{result, {default, broadcast, []}}.
+
+is_allowed_to_publish(PublishModel, Affiliation) ->
+    (PublishModel == open)
+    or (PublishModel == publishers)
+        and ((Affiliation == owner)
+              or (Affiliation == publisher)
+              or (Affiliation == publish_only)).
+
+remove_extra_items(Nidx, MaxItems, ItemIds) ->
+    node_flat:remove_extra_items(Nidx, MaxItems, ItemIds).
+
+delete_item(Nidx, Publisher, PublishModel, ItemId) ->
+    node_flat:delete_item(Nidx, Publisher, PublishModel, ItemId).
+
+purge_node(Nidx, Owner) ->
+    node_flat:purge_node(Nidx, Owner).
+
+get_entity_affiliations(Host, Owner) ->
+    {_, D, _} = SubKey = jid:tolower(Owner),
+    SubKey = jid:tolower(Owner),
+    GenKey = jid:remove_resource(SubKey),
+    States = mnesia:match_object(#pubsub_state{stateid = {GenKey, '_'}, _ = '_'}),
+    NodeTree = mod_pubsub:tree(Host),
+    Reply = lists:foldl(fun (#pubsub_state{stateid = {_, N}, affiliation = A}, Acc) ->
+		    case NodeTree:get_node(N) of
+			#pubsub_node{nodeid = {{_, D, _}, _}} = Node -> [{Node, A} | Acc];
+			_ -> Acc
+		    end
+	    end,
+	    [], States),
+    {result, Reply}.
+
+
+get_node_affiliations(Nidx) ->
+    node_flat:get_node_affiliations(Nidx).
+
+get_affiliation(Nidx, Owner) ->
+    node_flat:get_affiliation(Nidx, Owner).
+
+set_affiliation(Nidx, Owner, Affiliation) ->
+    node_flat:set_affiliation(Nidx, Owner, Affiliation).
+
+get_entity_subscriptions(Host, Owner) ->
+    {U, D, _} = SubKey = jid:tolower(Owner),
+    GenKey = jid:remove_resource(SubKey),
+    States = case SubKey of
+	GenKey ->
+	    mnesia:match_object(#pubsub_state{stateid = {{U, D, '_'}, '_'}, _ = '_'});
+	_ ->
+	    mnesia:match_object(#pubsub_state{stateid = {GenKey, '_'}, _ = '_'})
+	    ++
+	    mnesia:match_object(#pubsub_state{stateid = {SubKey, '_'}, _ = '_'})
+    end,
+    NodeTree = mod_pubsub:tree(Host),
+    Reply = lists:foldl(fun (#pubsub_state{stateid = {J, N}, subscriptions = Ss}, Acc) ->
+		    case NodeTree:get_node(N) of
+			#pubsub_node{nodeid = {{_, D, _}, _}} = Node ->
+			    lists:foldl(fun
+				    ({subscribed, SubId}, Acc2) ->
+					[{Node, subscribed, SubId, J} | Acc2];
+				    ({pending, _SubId}, Acc2) ->
+					[{Node, pending, J} | Acc2];
+				    (S, Acc2) ->
+					[{Node, S, J} | Acc2]
+				end,
+				Acc, Ss);
+			_ ->
+			    Acc
+		    end
+	    end,
+	    [], States),
+    {result, Reply}.
+
+get_node_subscriptions(Nidx) ->
+    node_flat:get_node_subscriptions(Nidx).
+
+get_subscriptions(Nidx, Owner) ->
+    node_flat:get_subscriptions(Nidx, Owner).
+
+set_subscriptions(Nidx, Owner, Subscription, SubId) ->
+    node_flat:set_subscriptions(Nidx, Owner, Subscription, SubId).
+
+get_pending_nodes(Host, Owner) ->
+    node_flat:get_pending_nodes(Host, Owner).
+
+get_states(Nidx) ->
+    node_flat:get_states(Nidx).
+
+get_state(Nidx, JID) ->
+    node_flat:get_state(Nidx, JID).
+
+set_state(State) ->
+    node_flat:set_state(State).
+
+get_items(Nidx, From, RSM) ->
+    node_flat:get_items(Nidx, From, RSM).
+
+get_items(Nidx, JID, AccessModel, PresenceSubscription, RosterGroup, SubId, RSM) ->
+    node_flat:get_items(Nidx, JID, AccessModel,
+	PresenceSubscription, RosterGroup, SubId, RSM).
+
+get_last_items(Nidx, From, Count) ->
+    node_flat:get_last_items(Nidx, From, Count).
+
+get_only_item(Nidx, From) ->
+    node_flat:get_only_item(Nidx, From).
+
+get_item(Nidx, ItemId) ->
+    node_flat:get_item(Nidx, ItemId).
+
+get_item(Nidx, ItemId, JID, AccessModel, PresenceSubscription, RosterGroup, SubId) ->
+    node_flat:get_item(Nidx, ItemId, JID, AccessModel,
+	PresenceSubscription, RosterGroup, SubId).
+
+set_item(Item) ->
+    node_flat:set_item(Item).
+
+get_item_name(Host, Node, Id) ->
+    node_flat:get_item_name(Host, Node, Id).
+
+node_to_path(Node) ->
+    node_flat:node_to_path(Node).
+
+path_to_node(Path) ->
+    node_flat:path_to_node(Path).
