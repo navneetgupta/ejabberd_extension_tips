@@ -107,7 +107,6 @@ publish_item(Nidx, Publisher, Model, _MaxItems, _ItemId, Payload, PubOpts) ->
 		_ -> get_state(Nidx, SubKey)
 	end,
 	Affiliation = GenState#pubsub_state.affiliation,
-	% {result, Affiliation} = node_flat:get_affiliation(Nidx, Publisher),
 	?INFO_MSG("Affiliation is: ~p", [Affiliation]),
 	ElPayload = [El || #push_notification{} = El <- Payload],
 	do_publish_item(PubOpts, ElPayload).  %% here assuming only valid request are coming will send notification wihtout futher validation.
@@ -120,6 +119,9 @@ publish_item(Nidx, Publisher, Model, _MaxItems, _ItemId, Payload, PubOpts) ->
 
 do_publish_item(PublishOptions, ElPayload) ->
 	?INFO_MSG("node_push:do_publish_item PublishOptions: ~p, ElPayLoad: ~p", [PublishOptions, ElPayload]),
+	% TODO: Run a hook and pass the data to that hook, handle hook in a seprate module and define this hook to use pool of http workers to call the notification service.(Can use mongoose_push(https://github.com/esl/MongoosePush)) to setup the http calls for third party apis(apns/gcm/firebase).
+	% ejabberd_hooks:run(push_notifications, ServerHost,
+  %                              [ServerHost, PublishOptions, ElPayload]),
 	{result, {default, broadcast, []}}.
 
 is_allowed_to_publish(PublishModel, Affiliation) ->
